@@ -1,0 +1,417 @@
+// =====================================================
+// F-16C ANTI ICE / ANT SEL module
+// ESP32-S3 Waveshare ETH PoE + W5500
+// DHCP, automatic DCS-LINK discovery and live module status
+//
+// In Avionicscraft Simulator Software select Output mode = DCS-BIOS.
+// =====================================================
+
+#include <SPI.h>
+#include <Ethernet.h>
+#include <EthernetUdp.h>
+
+namespace DcsBios {
+  bool tryToSendDcsBiosMessage(const char* msg, const char* arg);
+}
+
+#include <DcsBios.h>
+
+// W5500 pins
+#define W5500_CS    14
+#define W5500_SCK   13
+#define W5500_MISO  12
+#define W5500_MOSI  11
+#define W5500_RST   9
+
+// =====================================================
+// Three-position switch connections
+// Connect the common terminal of every switch to GND.
+// =====================================================
+
+// Engine ANTI ICE: ON / AUTO / OFF
+#define ANTI_ICE_ON_PIN   48  // Connector J2
+#define ANTI_ICE_OFF_PIN  47  // Connector J3
+
+// IFF ANT SEL: LOWER / NORM / UPPER
+#define IFF_ANT_UPPER_PIN 46  // Connector J5
+#define IFF_ANT_LOWER_PIN 45  // Connector J6
+
+// UHF ANT SEL: LOWER / NORM / UPPER
+#define UHF_ANT_UPPER_PIN 42  // Connector J8
+#define UHF_ANT_LOWER_PIN 41  // Connector J9
+
+// Panel backlight PWM output, identical to the other Avionicscraft modules.
+#define LED_PIN 43
+const int PWM_FREQUENCY = 5000;
+const int PWM_RESOLUTION = 8;
+
+// =====================================================
+// Module identity
+// =====================================================
+
+byte mac[] = { 0x02, 0x7F, 0xCA, 0x25, 0xAD, 0x11 };
+const char PANEL_NAME[] = "F16 Anti Ice ANT SEL";
+const char AIRCRAFT_NAME[] = "F-16C";
+const char MODULE_NAME[] = "Anti Ice / ANT SEL";
+
+// Text shown in the Component column of Avionicscraft Simulator Software.
+// These descriptions may be changed without changing the DCS-BIOS controls.
+const char LABEL_ANTI_ICE[] = "Engine anti-ice switch";
+const char LABEL_IFF_ANT[] = "IFF antenna selector switch";
+const char LABEL_UHF_ANT[] = "UHF antenna selector switch";
+const char LABEL_LED_BRIGHTNESS[] = "Panel LED brightness (GPIO 43)";
+const char LABEL_LED_TEST[] = "LED test";
+
+// Physical connector or label references shown in the Label number column.
+const char LABEL_NO_ANTI_ICE[] = "J2 / J3";
+const char LABEL_NO_IFF_ANT[] = "J5 / J6";
+const char LABEL_NO_UHF_ANT[] = "J8 / J9";
+const char LABEL_NO_LED_BRIGHTNESS[] = "LED-1";
+const char LABEL_NO_LED_TEST[] = "TEST";
+
+// Must match Avionicscraft Simulator Software.
+const uint16_t DCS_LINK_DISCOVERY_PORT = 39000;
+const uint16_t LOCAL_UDP_PORT = 39002;
+const uint16_t DEFAULT_PANEL_PORT = 39001;
+
+EthernetClient client;
+EthernetUDP discoveryUdp;
+DcsBios::ProtocolParser parser;
+
+IPAddress dcsLinkIp(0, 0, 0, 0);
+uint16_t dcsLinkPort = DEFAULT_PANEL_PORT;
+
+bool ethernetOk = false;
+bool telemetryPending = true;
+unsigned long lastDhcpRetry = 0;
+unsigned long lastDiscovery = 0;
+unsigned long lastDhcpMaintain = 0;
+unsigned long lastTelemetryTime = 0;
+unsigned long lastLedTestCommand = 0;
+int currentLedPwm = 0;
+bool ledTestActive = false;
+
+// =====================================================
+// DCS-BIOS transport
+// =====================================================
+
+namespace DcsBios {
+  bool tryToSendDcsBiosMessage(const char* msg, const char* arg) {
+    if (!client.connected()) return false;
+    if (client.print(msg) == 0) {
+      client.stop();
+      return false;
+    }
+    client.print(' ');
+    client.print(arg);
+    client.print('\n');
+    return true;
+  }
+}
+
+void onDcsBiosWrite(unsigned int address, unsigned int value) {
+}
+
+void onPriConsolesBrtKnbChange(unsigned int value) {
+  currentLedPwm = constrain(map(value, 0, 65535, 0, 255), 0, 255);
+  if (!ledTestActive) ledcWrite(LED_PIN, currentLedPwm);
+  telemetryPending = true;
+}
+
+DcsBios::IntegerBuffer priConsolesBrtKnbBuffer(
+  F_16C_50_PRI_CONSOLES_BRT_KNB,
+  onPriConsolesBrtKnbChange
+);
+
+// DCS-BIOS position order is the first contact, centre, second contact.
+DcsBios::Switch3Pos antiIceSwitch(
+  "ENG_ANTI_ICE",
+  ANTI_ICE_ON_PIN,
+  ANTI_ICE_OFF_PIN
+);
+
+// For both antenna selectors DCS-BIOS uses LOWER / NORM / UPPER.
+DcsBios::Switch3Pos iffAntSelSwitch(
+  "IFF_ANT_SEL_SW",
+  IFF_ANT_LOWER_PIN,
+  IFF_ANT_UPPER_PIN
+);
+
+DcsBios::Switch3Pos uhfAntSelSwitch(
+  "UHF_ANT_SEL_SW",
+  UHF_ANT_LOWER_PIN,
+  UHF_ANT_UPPER_PIN
+);
+
+// =====================================================
+// Live module status
+// =====================================================
+
+int readThreePositionSwitch(int firstPin, int secondPin) {
+  if (digitalRead(firstPin) == LOW) return 0;
+  if (digitalRead(secondPin) == LOW) return 2;
+  return 1;
+}
+
+void sendSwitchState(
+  const char* controlName,
+  int position,
+  const char* displayName,
+  const char* pinNumbers,
+  const char* labelNumbers
+) {
+  client.print("PANEL_STATE|");
+  client.print(controlName);
+  client.print('|');
+  client.print(position);
+  client.print('|');
+  client.print(displayName);
+  client.print("|INPUT|");
+  client.print(pinNumbers);
+  client.print('|');
+  client.println(labelNumbers);
+}
+
+void sendPanelTelemetry() {
+  if (!client.connected()) return;
+
+  sendSwitchState(
+    "ENG_ANTI_ICE",
+    readThreePositionSwitch(ANTI_ICE_ON_PIN, ANTI_ICE_OFF_PIN),
+    LABEL_ANTI_ICE,
+    "48 / 47",
+    LABEL_NO_ANTI_ICE
+  );
+
+  sendSwitchState(
+    "IFF_ANT_SEL_SW",
+    readThreePositionSwitch(IFF_ANT_LOWER_PIN, IFF_ANT_UPPER_PIN),
+    LABEL_IFF_ANT,
+    "46 / 45",
+    LABEL_NO_IFF_ANT
+  );
+
+  sendSwitchState(
+    "UHF_ANT_SEL_SW",
+    readThreePositionSwitch(UHF_ANT_LOWER_PIN, UHF_ANT_UPPER_PIN),
+    LABEL_UHF_ANT,
+    "42 / 41",
+    LABEL_NO_UHF_ANT
+  );
+
+  client.print("PANEL_STATE|LED_PWM_GPIO43|");
+  client.print(ledTestActive ? 255 : currentLedPwm);
+  client.print('|');
+  client.print(LABEL_LED_BRIGHTNESS);
+  client.print("|OUTPUT|43|");
+  client.println(LABEL_NO_LED_BRIGHTNESS);
+
+  client.print("PANEL_STATE|LED_TEST_ACTIVE|");
+  client.print(ledTestActive ? 1 : 0);
+  client.print('|');
+  client.print(LABEL_LED_TEST);
+  client.print("|COMMAND|-|");
+  client.println(LABEL_NO_LED_TEST);
+}
+
+void handleLedTestCommands() {
+  int packetSize;
+  while ((packetSize = discoveryUdp.parsePacket()) > 0) {
+    char message[32];
+    int readLength = discoveryUdp.read(message, min(packetSize, (int)sizeof(message) - 1));
+    message[readLength] = '\0';
+    if (!client.connected() || discoveryUdp.remoteIP() != dcsLinkIp) continue;
+
+    int enabled;
+    if (sscanf(message, "PANEL_LED_TEST|%d", &enabled) != 1 || (enabled != 0 && enabled != 1)) continue;
+    ledTestActive = enabled == 1;
+    lastLedTestCommand = millis();
+    ledcWrite(LED_PIN, ledTestActive ? 255 : currentLedPwm);
+    telemetryPending = true;
+  }
+
+  // Restore the DCS-controlled brightness if the release packet is lost.
+  if (ledTestActive && millis() - lastLedTestCommand > 800) {
+    ledTestActive = false;
+    ledcWrite(LED_PIN, currentLedPwm);
+    telemetryPending = true;
+  }
+}
+
+// =====================================================
+// Ethernet and DCS-LINK discovery
+// =====================================================
+
+void macToText(char* output, size_t outputSize) {
+  snprintf(
+    output,
+    outputSize,
+    "%02X:%02X:%02X:%02X:%02X:%02X",
+    mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+  );
+}
+
+void resetW5500() {
+  pinMode(W5500_RST, OUTPUT);
+  digitalWrite(W5500_RST, LOW);
+  delay(300);
+  digitalWrite(W5500_RST, HIGH);
+  delay(1000);
+}
+
+void startEthernet() {
+  SPI.begin(W5500_SCK, W5500_MISO, W5500_MOSI, W5500_CS);
+  SPI.setFrequency(8000000);
+  Ethernet.init(W5500_CS);
+
+  Serial.println("Requesting DHCP address...");
+  if (Ethernet.begin(mac) == 0) {
+    ethernetOk = false;
+    Serial.println("DHCP failed.");
+    return;
+  }
+
+  ethernetOk = true;
+  dcsLinkIp = IPAddress(0, 0, 0, 0);
+  discoveryUdp.begin(LOCAL_UDP_PORT);
+  Serial.print("DHCP address: ");
+  Serial.println(Ethernet.localIP());
+}
+
+void discoverDcsLink() {
+  char macText[18];
+  char request[110];
+  macToText(macText, sizeof(macText));
+  snprintf(
+    request,
+    sizeof(request),
+    "DCS_PANEL_DISCOVER|%s|%s\n",
+    macText,
+    PANEL_NAME
+  );
+
+  discoveryUdp.beginPacket(IPAddress(255, 255, 255, 255), DCS_LINK_DISCOVERY_PORT);
+  discoveryUdp.write((const uint8_t*)request, strlen(request));
+  discoveryUdp.endPacket();
+
+  unsigned long started = millis();
+  while (millis() - started < 250) {
+    int packetLength = discoveryUdp.parsePacket();
+    if (packetLength <= 0) {
+      delay(2);
+      continue;
+    }
+
+    char response[48];
+    int readLength = discoveryUdp.read(response, min(packetLength, (int)sizeof(response) - 1));
+    response[readLength] = '\0';
+
+    int port = 0;
+    if (sscanf(response, "DCS_PANEL_HUB|%d", &port) == 1 && port > 0 && port < 65536) {
+      dcsLinkIp = discoveryUdp.remoteIP();
+      dcsLinkPort = (uint16_t)port;
+      Serial.print("DCS-LINK found: ");
+      Serial.print(dcsLinkIp);
+      Serial.print(':');
+      Serial.println(dcsLinkPort);
+      return;
+    }
+  }
+}
+
+void connectToDcsLink() {
+  if (client.connected() || dcsLinkIp == IPAddress(0, 0, 0, 0)) return;
+
+  client.stop();
+  client.setTimeout(100);
+  if (!client.connect(dcsLinkIp, dcsLinkPort)) {
+    Serial.println("DCS-LINK connection failed.");
+    return;
+  }
+
+  char macText[18];
+  char hello[120];
+  macToText(macText, sizeof(macText));
+  snprintf(
+    hello,
+    sizeof(hello),
+    "DCS_PANEL_HELLO|%s|%s|%s\n",
+    macText,
+    AIRCRAFT_NAME,
+    MODULE_NAME
+  );
+  client.print(hello);
+  telemetryPending = true;
+  Serial.println("Connected to DCS-LINK.");
+}
+
+// =====================================================
+// Setup and loop
+// =====================================================
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  ledcAttach(LED_PIN, PWM_FREQUENCY, PWM_RESOLUTION);
+  ledcWrite(LED_PIN, 0);
+
+  resetW5500();
+  startEthernet();
+}
+
+void loop() {
+  unsigned long now = millis();
+
+  if (!ethernetOk) {
+    if (now - lastDhcpRetry >= 10000) {
+      lastDhcpRetry = now;
+      startEthernet();
+    }
+    delay(10);
+    return;
+  }
+
+  if (Ethernet.linkStatus() == LinkOFF) {
+    client.stop();
+    ledTestActive = false;
+    ledcWrite(LED_PIN, currentLedPwm);
+    delay(100);
+    return;
+  }
+
+  if (now - lastDhcpMaintain >= 60000) {
+    Ethernet.maintain();
+    lastDhcpMaintain = now;
+  }
+
+  handleLedTestCommands();
+
+  if (!client.connected()) {
+    if (now - lastDiscovery >= 1000) {
+      lastDiscovery = now;
+      discoverDcsLink();
+      connectToDcsLink();
+    }
+  } else {
+    int readLimit = 256;
+    while (client.available() && readLimit--) {
+      int input = client.read();
+      if (input < 0) break;
+      parser.processChar((char)input);
+      delayMicroseconds(20);
+    }
+  }
+
+  DcsBios::PollingInput::pollInputs();
+  DcsBios::ExportStreamListener::loopAll();
+
+  // Frequent telemetry is also the connection heartbeat used by DCS-LINK.
+  if (client.connected() && (telemetryPending || now - lastTelemetryTime >= 100)) {
+    sendPanelTelemetry();
+    lastTelemetryTime = now;
+    telemetryPending = false;
+  }
+
+  delay(1);
+}
