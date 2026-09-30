@@ -1,0 +1,389 @@
+// =====================================================
+// F-16C HUD panel — ESP32-S3 Waveshare ETH PoE + W5500
+// DCS-BIOS through DCS-LINK
+//
+// In Avionicscraft Simulator Software select: Output mode = DCS-BIOS
+// =====================================================
+
+#include <SPI.h>
+#include <Ethernet.h>
+#include <EthernetUdp.h>
+
+namespace DcsBios {
+  bool tryToSendDcsBiosMessage(const char* msg, const char* arg);
+}
+
+#include <DcsBios.h>
+
+// W5500 pins
+#define W5500_CS    14
+#define W5500_SCK   13
+#define W5500_MISO  12
+#define W5500_MOSI  11
+#define W5500_RST   9
+
+#define STRINGIFY_VALUE_INNER(value) #value
+#define STRINGIFY_VALUE(value) STRINGIFY_VALUE_INNER(value)
+
+// Panel LED
+#define LED_PIN 43
+const int PWM_FREQUENCY = 5000;
+const int PWM_RESOLUTION = 8;
+
+// Switch inputs. The software displays these GPIO values automatically.
+#define HUD_SCALES_PIN_A      33
+#define HUD_SCALES_PIN_B      34
+#define HUD_FP_MARKER_PIN_A   35
+#define HUD_FP_MARKER_PIN_B   36
+#define HUD_DED_DATA_PIN_A    37
+#define HUD_DED_DATA_PIN_B    38
+#define HUD_DEPRESS_RET_PIN_A 18
+#define HUD_DEPRESS_RET_PIN_B 16
+#define HUD_SPEED_PIN_A       2
+#define HUD_SPEED_PIN_B       3
+#define HUD_ALT_PIN_A         19
+#define HUD_ALT_PIN_B         20
+#define HUD_BRT_PIN_A         46
+#define HUD_BRT_PIN_B         47
+#define HUD_TEST_PIN_A        41
+#define HUD_TEST_PIN_B        42
+
+// Give every ESP32 panel a unique MAC address and panel name.
+byte mac[] = { 0x02, 0x68, 0x0B, 0x5D, 0xE3, 0xA4 };
+const char PANEL_NAME[] = "F16 HUD";
+const char AIRCRAFT_NAME[] = "F-16C";
+const char MODULE_NAME[] = "HUD";
+
+// Text shown in the Component column of Avionicscraft Simulator Software.
+// Change these labels freely; keep the DCS-BIOS control names unchanged.
+const char LABEL_HUD_SCALES[] = "HUD scales switch";
+const char LABEL_HUD_FP_MARKER[] = "HUD flight path marker switch";
+const char LABEL_HUD_DED_DATA[] = "HUD DED data switch";
+const char LABEL_HUD_DEPRESS_RET[] = "HUD depress reticle switch";
+const char LABEL_HUD_SPEED[] = "HUD speed switch";
+const char LABEL_HUD_ALT[] = "HUD altitude switch";
+const char LABEL_HUD_BRIGHTNESS[] = "HUD brightness switch";
+const char LABEL_HUD_TEST[] = "HUD test switch";
+const char LABEL_LED_BRIGHTNESS[] = "Panel LED brightness (GPIO 43)";
+const char LABEL_LED_TEST[] = "LED test";
+
+// Physical label or connector reference shown by the software.
+// Change these values to the label numbers used on your panel.
+const char LABEL_NO_HUD_SCALES[] = "HUD-01";
+const char LABEL_NO_HUD_FP_MARKER[] = "HUD-02";
+const char LABEL_NO_HUD_DED_DATA[] = "HUD-03";
+const char LABEL_NO_HUD_DEPRESS_RET[] = "HUD-04";
+const char LABEL_NO_HUD_SPEED[] = "HUD-05";
+const char LABEL_NO_HUD_ALT[] = "HUD-06";
+const char LABEL_NO_HUD_BRIGHTNESS[] = "HUD-07";
+const char LABEL_NO_HUD_TEST[] = "HUD-08";
+const char LABEL_NO_LED_BRIGHTNESS[] = "LED-1";
+const char LABEL_NO_LED_TEST[] = "TEST";
+
+// Must match the DCS-LINK Windows application.
+const uint16_t HUB_DISCOVERY_PORT = 39000;
+const uint16_t LOCAL_UDP_PORT = 39002;
+
+EthernetClient client;
+EthernetUDP discoveryUdp;
+DcsBios::ProtocolParser parser;
+
+IPAddress dcsLinkIp(0, 0, 0, 0);
+uint16_t dcsLinkPort = 39001;
+
+bool ethernetOk = false;
+unsigned long lastDhcpRetry = 0;
+unsigned long lastDiscovery = 0;
+unsigned long lastDhcpMaintain = 0;
+unsigned long lastTelemetryTime = 0;
+bool telemetryPending = true;
+int currentLedPwm = 0;
+bool ledTestActive = false;
+unsigned long lastLedTestCommand = 0;
+
+// =====================================================
+// DCS-BIOS transport
+// =====================================================
+
+namespace DcsBios {
+  bool tryToSendDcsBiosMessage(const char* msg, const char* arg) {
+    if (!client.connected()) return false;
+
+    if (client.print(msg) == 0) {
+      client.stop();
+      return false;
+    }
+
+    client.print(' ');
+    client.print(arg);
+    client.print('\n');
+    return true;
+  }
+}
+
+// =====================================================
+// Panel outputs
+// =====================================================
+
+void onPriConsolesBrtKnbChange(unsigned int value) {
+  int brightness = constrain(map(value, 0, 65535, 0, 255), 0, 255);
+  currentLedPwm = brightness;
+  if (!ledTestActive) ledcWrite(LED_PIN, brightness);
+}
+
+DcsBios::IntegerBuffer priConsolesBrtKnbBuffer(
+  F_16C_50_PRI_CONSOLES_BRT_KNB,
+  onPriConsolesBrtKnbChange
+);
+
+void onClockElapsedTimeSecChange(unsigned int value) {
+  Serial.println(value);
+}
+
+DcsBios::IntegerBuffer clockElapsedTimeSecBuffer(
+  F_16C_50_CLOCK_ELAPSED_TIME_SEC,
+  onClockElapsedTimeSecChange
+);
+
+void onDcsBiosWrite(unsigned int address, unsigned int value) {
+}
+
+// =====================================================
+// Panel switches
+// Keep these original pin assignments: they are confirmed working.
+// For every three-position switch: common terminal -> GND,
+// the two other terminals -> the two GPIO pins.
+// =====================================================
+
+DcsBios::Switch3Pos hudScalesSw("HUD_SCALES_SW", HUD_SCALES_PIN_A, HUD_SCALES_PIN_B);
+DcsBios::Switch3Pos hudFpMarkerSw("HUD_FP_MARKER_SW", HUD_FP_MARKER_PIN_A, HUD_FP_MARKER_PIN_B);
+DcsBios::Switch3Pos hudDedDataSw("HUD_DED_DATA_SW", HUD_DED_DATA_PIN_A, HUD_DED_DATA_PIN_B);
+DcsBios::Switch3Pos hudDepressRetSw("HUD_DEPRESS_RET_SW", HUD_DEPRESS_RET_PIN_A, HUD_DEPRESS_RET_PIN_B);
+DcsBios::Switch3Pos hudSpeedSw("HUD_SPEED_SW", HUD_SPEED_PIN_A, HUD_SPEED_PIN_B);
+DcsBios::Switch3Pos hudAltSw("HUD_ALT_SW", HUD_ALT_PIN_A, HUD_ALT_PIN_B);
+DcsBios::Switch3Pos hudBrtSw("HUD_BRT_SW", HUD_BRT_PIN_A, HUD_BRT_PIN_B);
+DcsBios::Switch3Pos hudTestSw("HUD_TEST_SW", HUD_TEST_PIN_A, HUD_TEST_PIN_B);
+
+// Status is sent separately from DCS-BIOS commands. Position numbering
+// matches the Switch3Pos library: first pin LOW = 0, neither LOW = 1,
+// second pin LOW = 2.
+void sendSwitchState(
+  const char* name,
+  int firstPin,
+  int secondPin,
+  const char* displayName,
+  const char* pinNumber,
+  const char* labelNumber
+) {
+  int position = digitalRead(firstPin) == LOW ? 0 : digitalRead(secondPin) == LOW ? 2 : 1;
+  client.print("PANEL_STATE|");
+  client.print(name);
+  client.print('|');
+  client.print(position);
+  client.print('|');
+  client.print(displayName);
+  client.print("|INPUT|");
+  client.print(pinNumber);
+  client.print('|');
+  client.println(labelNumber);
+}
+
+void sendPanelTelemetry() {
+  if (!client.connected()) return;
+  sendSwitchState("HUD_SCALES_SW", HUD_SCALES_PIN_A, HUD_SCALES_PIN_B, LABEL_HUD_SCALES, STRINGIFY_VALUE(HUD_SCALES_PIN_A) " / " STRINGIFY_VALUE(HUD_SCALES_PIN_B), LABEL_NO_HUD_SCALES);
+  sendSwitchState("HUD_FP_MARKER_SW", HUD_FP_MARKER_PIN_A, HUD_FP_MARKER_PIN_B, LABEL_HUD_FP_MARKER, STRINGIFY_VALUE(HUD_FP_MARKER_PIN_A) " / " STRINGIFY_VALUE(HUD_FP_MARKER_PIN_B), LABEL_NO_HUD_FP_MARKER);
+  sendSwitchState("HUD_DED_DATA_SW", HUD_DED_DATA_PIN_A, HUD_DED_DATA_PIN_B, LABEL_HUD_DED_DATA, STRINGIFY_VALUE(HUD_DED_DATA_PIN_A) " / " STRINGIFY_VALUE(HUD_DED_DATA_PIN_B), LABEL_NO_HUD_DED_DATA);
+  sendSwitchState("HUD_DEPRESS_RET_SW", HUD_DEPRESS_RET_PIN_A, HUD_DEPRESS_RET_PIN_B, LABEL_HUD_DEPRESS_RET, STRINGIFY_VALUE(HUD_DEPRESS_RET_PIN_A) " / " STRINGIFY_VALUE(HUD_DEPRESS_RET_PIN_B), LABEL_NO_HUD_DEPRESS_RET);
+  sendSwitchState("HUD_SPEED_SW", HUD_SPEED_PIN_A, HUD_SPEED_PIN_B, LABEL_HUD_SPEED, STRINGIFY_VALUE(HUD_SPEED_PIN_A) " / " STRINGIFY_VALUE(HUD_SPEED_PIN_B), LABEL_NO_HUD_SPEED);
+  sendSwitchState("HUD_ALT_SW", HUD_ALT_PIN_A, HUD_ALT_PIN_B, LABEL_HUD_ALT, STRINGIFY_VALUE(HUD_ALT_PIN_A) " / " STRINGIFY_VALUE(HUD_ALT_PIN_B), LABEL_NO_HUD_ALT);
+  sendSwitchState("HUD_BRT_SW", HUD_BRT_PIN_A, HUD_BRT_PIN_B, LABEL_HUD_BRIGHTNESS, STRINGIFY_VALUE(HUD_BRT_PIN_A) " / " STRINGIFY_VALUE(HUD_BRT_PIN_B), LABEL_NO_HUD_BRIGHTNESS);
+  sendSwitchState("HUD_TEST_SW", HUD_TEST_PIN_A, HUD_TEST_PIN_B, LABEL_HUD_TEST, STRINGIFY_VALUE(HUD_TEST_PIN_A) " / " STRINGIFY_VALUE(HUD_TEST_PIN_B), LABEL_NO_HUD_TEST);
+  client.print("PANEL_STATE|LED_PWM_GPIO43|");
+  client.print(ledTestActive ? 255 : currentLedPwm);
+  client.print('|'); client.print(LABEL_LED_BRIGHTNESS);
+  client.print("|OUTPUT|"); client.print(STRINGIFY_VALUE(LED_PIN));
+  client.print('|'); client.println(LABEL_NO_LED_BRIGHTNESS);
+  client.print("PANEL_STATE|LED_TEST_ACTIVE|");
+  client.print(ledTestActive ? 1 : 0);
+  client.print('|'); client.print(LABEL_LED_TEST);
+  client.print("|COMMAND|-|"); client.println(LABEL_NO_LED_TEST);
+}
+
+void handleLedTestCommands() {
+  int packetSize;
+  while ((packetSize = discoveryUdp.parsePacket()) > 0) {
+    char message[32];
+    int readLength = discoveryUdp.read(message, min(packetSize, (int)sizeof(message) - 1));
+    message[readLength] = '\0';
+    if (discoveryUdp.remoteIP() != dcsLinkIp || !client.connected()) continue;
+    int enabled;
+    if (sscanf(message, "PANEL_LED_TEST|%d", &enabled) != 1 || (enabled != 0 && enabled != 1)) continue;
+    ledTestActive = enabled == 1;
+    lastLedTestCommand = millis();
+    ledcWrite(LED_PIN, ledTestActive ? 255 : currentLedPwm);
+  }
+  // Restore DCS brightness if the test button is released without a final packet.
+  if (ledTestActive && millis() - lastLedTestCommand > 800) {
+    ledTestActive = false;
+    ledcWrite(LED_PIN, currentLedPwm);
+  }
+}
+
+// =====================================================
+// Network helpers
+// =====================================================
+
+void macToText(char* output, size_t outputSize) {
+  snprintf(output, outputSize, "%02X:%02X:%02X:%02X:%02X:%02X",
+    mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+}
+
+void resetW5500() {
+  pinMode(W5500_RST, OUTPUT);
+  digitalWrite(W5500_RST, LOW);
+  delay(300);
+  digitalWrite(W5500_RST, HIGH);
+  delay(1000);
+}
+
+void startEthernet() {
+  SPI.begin(W5500_SCK, W5500_MISO, W5500_MOSI, W5500_CS);
+  SPI.setFrequency(8000000);
+  Ethernet.init(W5500_CS);
+
+  Serial.println("Requesting DHCP address...");
+  if (Ethernet.begin(mac) == 0) {
+    ethernetOk = false;
+    Serial.println("DHCP failed.");
+    return;
+  }
+
+  ethernetOk = true;
+  dcsLinkIp = IPAddress(0, 0, 0, 0);
+  discoveryUdp.begin(LOCAL_UDP_PORT);
+  Serial.print("DHCP address: ");
+  Serial.println(Ethernet.localIP());
+}
+
+void discoverDcsLink() {
+  char macText[18];
+  char request[100];
+  macToText(macText, sizeof(macText));
+  snprintf(request, sizeof(request), "DCS_PANEL_DISCOVER|%s|%s\n", macText, PANEL_NAME);
+
+  discoveryUdp.beginPacket(IPAddress(255, 255, 255, 255), HUB_DISCOVERY_PORT);
+  discoveryUdp.write((const uint8_t*)request, strlen(request));
+  discoveryUdp.endPacket();
+
+  unsigned long started = millis();
+  while (millis() - started < 250) {
+    int packetLength = discoveryUdp.parsePacket();
+    if (packetLength <= 0) {
+      delay(2);
+      continue;
+    }
+
+    char response[48];
+    int bytesToRead = min(packetLength, (int)sizeof(response) - 1);
+    int bytesRead = discoveryUdp.read(response, bytesToRead);
+    response[bytesRead] = '\0';
+
+    int port = 0;
+    if (sscanf(response, "DCS_PANEL_HUB|%d", &port) == 1 && port > 0 && port < 65536) {
+      dcsLinkIp = discoveryUdp.remoteIP();
+      dcsLinkPort = (uint16_t)port;
+      Serial.print("DCS-LINK found: ");
+      Serial.print(dcsLinkIp);
+      Serial.print(":");
+      Serial.println(dcsLinkPort);
+      return;
+    }
+  }
+}
+
+void connectToDcsLink() {
+  if (client.connected() || dcsLinkIp == IPAddress(0, 0, 0, 0)) return;
+
+  client.stop();
+  client.setTimeout(100);
+  if (!client.connect(dcsLinkIp, dcsLinkPort)) {
+    Serial.println("DCS-LINK connection failed.");
+    return;
+  }
+
+  char macText[18];
+  char hello[100];
+  macToText(macText, sizeof(macText));
+  snprintf(hello, sizeof(hello), "DCS_PANEL_HELLO|%s|%s|%s\n", macText, AIRCRAFT_NAME, MODULE_NAME);
+  client.print(hello);
+  telemetryPending = true;
+  Serial.println("Connected to DCS-LINK.");
+}
+
+// =====================================================
+// Setup and loop
+// =====================================================
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  ledcAttach(LED_PIN, PWM_FREQUENCY, PWM_RESOLUTION);
+  ledcWrite(LED_PIN, 0);
+
+  resetW5500();
+  startEthernet();
+}
+
+void loop() {
+  unsigned long now = millis();
+
+  if (!ethernetOk) {
+    if (now - lastDhcpRetry >= 10000) {
+      lastDhcpRetry = now;
+      startEthernet();
+    }
+    delay(10);
+    return;
+  }
+
+  if (Ethernet.linkStatus() == LinkOFF) {
+    client.stop();
+    ledTestActive = false;
+    ledcWrite(LED_PIN, currentLedPwm);
+    delay(100);
+    return;
+  }
+
+  if (now - lastDhcpMaintain >= 60000) {
+    Ethernet.maintain();
+    lastDhcpMaintain = now;
+  }
+
+  handleLedTestCommands();
+
+  if (!client.connected()) {
+    if (now - lastDiscovery >= 1000) {
+      lastDiscovery = now;
+      discoverDcsLink();
+      connectToDcsLink();
+    }
+  } else {
+    int readLimit = 256;
+    while (client.available() && readLimit--) {
+      int input = client.read();
+      if (input < 0) break;
+      parser.processChar((char)input);
+      delayMicroseconds(20);
+    }
+  }
+
+  DcsBios::PollingInput::pollInputs();
+  DcsBios::ExportStreamListener::loopAll();
+  if (client.connected() && (telemetryPending || millis() - lastTelemetryTime >= 100)) {
+    sendPanelTelemetry();
+    lastTelemetryTime = millis();
+    telemetryPending = false;
+  }
+  delay(1);
+}
