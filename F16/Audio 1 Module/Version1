@@ -1,0 +1,509 @@
+// =====================================================
+// F-16C AUDIO 1 module
+// ESP32-S3 Waveshare ETH PoE + W5500
+// DHCP, automatic DCS-LINK discovery and live module status
+//
+// In Avionicscraft Simulator Software select Output mode = DCS-BIOS.
+// =====================================================
+
+#include <SPI.h>
+#include <Ethernet.h>
+#include <EthernetUdp.h>
+
+namespace DcsBios {
+  bool tryToSendDcsBiosMessage(const char* msg, const char* arg);
+}
+
+#include <DcsBios.h>
+
+// W5500 pins
+#define W5500_CS    14
+#define W5500_SCK   13
+#define W5500_MISO  12
+#define W5500_MOSI  11
+#define W5500_RST   9
+
+// PWM output controlled by PRI_CONSOLES_BRT_KNB
+#define LED_PIN 43
+const int PWM_FREQUENCY = 5000;
+const int PWM_RESOLUTION = 8;
+
+// COMM mode rotary switches. Every selected contact connects to GND.
+#define COMM1_OFF_PIN 48  // J20
+#define COMM1_SQL_PIN 47  // J21
+#define COMM1_GD_PIN  46  // J22
+#define COMM2_OFF_PIN 45  // J24
+#define COMM2_SQL_PIN 42  // J25
+#define COMM2_GD_PIN  41  // J26
+
+// Potentiometer wipers. Outer terminals connect to 3V3 and GND.
+#define POT_COMM1       0   // J2 / POT-1
+#define POT_COMM2       1   // J5 / POT-2
+#define POT_SEC_VOICE   2   // J8 / POT-3
+#define POT_MSL         3   // J11 / POT-4
+#define POT_TF          15  // J14 / POT-5
+#define POT_THREAT      18  // J17 / POT-6
+
+#define STRINGIFY_VALUE_INNER(value) #value
+#define STRINGIFY_VALUE(value) STRINGIFY_VALUE_INNER(value)
+
+// ADC calibration. Adjust after checking the raw readings in Serial Monitor.
+const int ADC_MINIMUM = 150;
+const int ADC_MAXIMUM = 3800;
+const bool POT_OUTPUT_INVERTED = false;
+
+// Every module must have a unique MAC address and module name.
+byte mac[] = { 0x02, 0x0C, 0x3D, 0x88, 0x7F, 0xA9 };
+const char PANEL_NAME[] = "F16 Audio 1";
+const char AIRCRAFT_NAME[] = "F-16C";
+const char MODULE_NAME[] = "Audio 1";
+
+// Text shown in the Component column of Avionicscraft Simulator Software.
+// Change these labels freely; keep the DCS-BIOS control names unchanged.
+const char LABEL_COMM1_MODE[] = "COMM 1 mode selector";
+const char LABEL_COMM2_MODE[] = "COMM 2 mode selector";
+const char LABEL_COMM1_VOLUME[] = "COMM 1 volume potentiometer";
+const char LABEL_COMM2_VOLUME[] = "COMM 2 volume potentiometer";
+const char LABEL_SEC_VOICE[] = "Secure voice volume potentiometer";
+const char LABEL_MSL[] = "Missile tone volume potentiometer";
+const char LABEL_TF[] = "Terrain-following tone potentiometer";
+const char LABEL_THREAT[] = "Threat tone volume potentiometer";
+const char LABEL_LED_BRIGHTNESS[] = "Panel LED brightness (GPIO 43)";
+const char LABEL_LED_TEST[] = "LED test";
+
+// Physical label or connector reference shown by the software.
+// These values are descriptive and may be changed to match your panel labels.
+const char LABEL_NO_COMM1_MODE[] = "J20 / J21 / J22";
+const char LABEL_NO_COMM2_MODE[] = "J24 / J25 / J26";
+const char LABEL_NO_COMM1_VOLUME[] = "J2 / POT-1";
+const char LABEL_NO_COMM2_VOLUME[] = "J5 / POT-2";
+const char LABEL_NO_SEC_VOICE[] = "J8 / POT-3";
+const char LABEL_NO_MSL[] = "J11 / POT-4";
+const char LABEL_NO_TF[] = "J14 / POT-5";
+const char LABEL_NO_THREAT[] = "J17 / POT-6";
+const char LABEL_NO_LED_BRIGHTNESS[] = "J0";
+const char LABEL_NO_LED_TEST[] = "TEST";
+
+// Must match Avionicscraft Simulator Software.
+const uint16_t DCS_LINK_DISCOVERY_PORT = 39000;
+const uint16_t LOCAL_UDP_PORT = 39002;
+const uint16_t DEFAULT_PANEL_PORT = 39001;
+
+EthernetClient client;
+EthernetUDP discoveryUdp;
+DcsBios::ProtocolParser parser;
+
+IPAddress dcsLinkIp(0, 0, 0, 0);
+uint16_t dcsLinkPort = DEFAULT_PANEL_PORT;
+
+bool ethernetOk = false;
+bool telemetryPending = true;
+bool ledTestActive = false;
+unsigned long lastDhcpRetry = 0;
+unsigned long lastDiscovery = 0;
+unsigned long lastDhcpMaintain = 0;
+unsigned long lastTelemetryTime = 0;
+unsigned long lastLedTestCommand = 0;
+
+int currentLedPwm = 0;
+
+struct PotentiometerState {
+  const char* controlName;
+  const char* displayName;
+  const char* labelNumber;
+  uint8_t pin;
+  int filteredValue;
+  int dcsValue;
+  int lastSentValue;
+};
+
+PotentiometerState potentiometers[] = {
+  { "COMM1_PWR_KNB", LABEL_COMM1_VOLUME, LABEL_NO_COMM1_VOLUME, POT_COMM1, 0, 0, -1 },
+  { "COMM2_PWR_KNB", LABEL_COMM2_VOLUME, LABEL_NO_COMM2_VOLUME, POT_COMM2, 0, 0, -1 },
+  { "SEC_VOICE_KNB", LABEL_SEC_VOICE, LABEL_NO_SEC_VOICE, POT_SEC_VOICE, 0, 0, -1 },
+  { "MSL_KNB", LABEL_MSL, LABEL_NO_MSL, POT_MSL, 0, 0, -1 },
+  { "TF_KNB", LABEL_TF, LABEL_NO_TF, POT_TF, 0, 0, -1 },
+  { "THREAT_KNB", LABEL_THREAT, LABEL_NO_THREAT, POT_THREAT, 0, 0, -1 }
+};
+
+const size_t POTENTIOMETER_COUNT = sizeof(potentiometers) / sizeof(potentiometers[0]);
+
+// =====================================================
+// DCS-BIOS transport
+// =====================================================
+
+namespace DcsBios {
+  bool tryToSendDcsBiosMessage(const char* msg, const char* arg) {
+    if (!client.connected()) return false;
+    if (client.print(msg) == 0) {
+      client.stop();
+      return false;
+    }
+    client.print(' ');
+    client.print(arg);
+    client.print('\n');
+    return true;
+  }
+}
+
+// =====================================================
+// DCS-BIOS input and output definitions
+// =====================================================
+
+void onPriConsolesBrtKnbChange(unsigned int value) {
+  currentLedPwm = constrain(map(value, 0, 65535, 0, 255), 0, 255);
+  if (!ledTestActive) ledcWrite(LED_PIN, currentLedPwm);
+}
+
+DcsBios::IntegerBuffer priConsolesBrtKnbBuffer(
+  F_16C_50_PRI_CONSOLES_BRT_KNB,
+  onPriConsolesBrtKnbChange
+);
+
+const byte comm1ModePins[3] = { COMM1_OFF_PIN, COMM1_SQL_PIN, COMM1_GD_PIN };
+const byte comm2ModePins[3] = { COMM2_OFF_PIN, COMM2_SQL_PIN, COMM2_GD_PIN };
+
+DcsBios::SwitchMultiPos comm1ModeKnb("COMM1_MODE_KNB", comm1ModePins, 3);
+DcsBios::SwitchMultiPos comm2ModeKnb("COMM2_MODE_KNB", comm2ModePins, 3);
+
+void onDcsBiosWrite(unsigned int address, unsigned int value) {
+}
+
+// =====================================================
+// Potentiometers
+// =====================================================
+
+int scalePotentiometer(int rawValue) {
+  int constrainedValue = constrain(rawValue, ADC_MINIMUM, ADC_MAXIMUM);
+  if (POT_OUTPUT_INVERTED) {
+    return constrain(map(constrainedValue, ADC_MINIMUM, ADC_MAXIMUM, 65535, 0), 0, 65535);
+  }
+  return constrain(map(constrainedValue, ADC_MINIMUM, ADC_MAXIMUM, 0, 65535), 0, 65535);
+}
+
+void readPotentiometers(bool forceSend) {
+  for (size_t index = 0; index < POTENTIOMETER_COUNT; index++) {
+    PotentiometerState& pot = potentiometers[index];
+    int rawValue = analogRead(pot.pin);
+    pot.filteredValue = (pot.filteredValue * 9 + rawValue) / 10;
+    pot.dcsValue = scalePotentiometer(pot.filteredValue);
+
+    if (forceSend || pot.lastSentValue < 0 || abs(pot.dcsValue - pot.lastSentValue) > 150) {
+      char valueText[16];
+      snprintf(valueText, sizeof(valueText), "%d", pot.dcsValue);
+      if (DcsBios::tryToSendDcsBiosMessage(pot.controlName, valueText)) {
+        pot.lastSentValue = pot.dcsValue;
+      }
+    }
+  }
+}
+
+int readThreePositionRotary(const byte pins[3]) {
+  for (int position = 0; position < 3; position++) {
+    if (digitalRead(pins[position]) == LOW) return position;
+  }
+  return -1;
+}
+
+void sendModeToDcs(const char* controlName, const byte pins[3]) {
+  int position = readThreePositionRotary(pins);
+  if (position < 0) return;
+  char valueText[4];
+  snprintf(valueText, sizeof(valueText), "%d", position);
+  DcsBios::tryToSendDcsBiosMessage(controlName, valueText);
+}
+
+void sendCurrentSwitchesToDcs() {
+  sendModeToDcs("COMM1_MODE_KNB", comm1ModePins);
+  sendModeToDcs("COMM2_MODE_KNB", comm2ModePins);
+}
+
+const char* commModeText(int position) {
+  switch (position) {
+    case 0: return "OFF";
+    case 1: return "SQL";
+    case 2: return "GD";
+    default: return "No contact";
+  }
+}
+
+// =====================================================
+// Live module status
+// =====================================================
+
+void sendState(
+  const char* component,
+  int value,
+  const char* displayName,
+  const char* ioType,
+  const char* pinNumber,
+  const char* labelNumber
+) {
+  client.print("PANEL_STATE|");
+  client.print(component);
+  client.print('|');
+  client.print(value);
+  client.print('|');
+  client.print(displayName);
+  client.print('|');
+  client.print(ioType);
+  client.print('|');
+  client.print(pinNumber);
+  client.print('|');
+  client.println(labelNumber);
+}
+
+void sendTextState(
+  const char* component,
+  const char* value,
+  const char* displayName,
+  const char* pinNumber,
+  const char* labelNumber
+) {
+  client.print("PANEL_STATE|");
+  client.print(component);
+  client.print('|');
+  client.print(value);
+  client.print('|');
+  client.print(displayName);
+  client.print("|INPUT|");
+  client.print(pinNumber);
+  client.print('|');
+  client.println(labelNumber);
+}
+
+void sendPanelTelemetry() {
+  if (!client.connected()) return;
+  sendTextState(
+    "COMM1_MODE_KNB",
+    commModeText(readThreePositionRotary(comm1ModePins)),
+    LABEL_COMM1_MODE,
+    "48 / 47 / 46",
+    LABEL_NO_COMM1_MODE
+  );
+  sendTextState(
+    "COMM2_MODE_KNB",
+    commModeText(readThreePositionRotary(comm2ModePins)),
+    LABEL_COMM2_MODE,
+    "45 / 42 / 41",
+    LABEL_NO_COMM2_MODE
+  );
+  for (size_t index = 0; index < POTENTIOMETER_COUNT; index++) {
+    char pinText[5];
+    snprintf(pinText, sizeof(pinText), "%u", potentiometers[index].pin);
+    sendState(
+      potentiometers[index].controlName,
+      potentiometers[index].dcsValue,
+      potentiometers[index].displayName,
+      "INPUT",
+      pinText,
+      potentiometers[index].labelNumber
+    );
+  }
+  sendState("LED_PWM_GPIO43", ledTestActive ? 255 : currentLedPwm, LABEL_LED_BRIGHTNESS, "OUTPUT", STRINGIFY_VALUE(LED_PIN), LABEL_NO_LED_BRIGHTNESS);
+  sendState("LED_TEST_ACTIVE", ledTestActive ? 1 : 0, LABEL_LED_TEST, "COMMAND", "-", LABEL_NO_LED_TEST);
+}
+
+void handleLedTestCommands() {
+  int packetSize;
+  while ((packetSize = discoveryUdp.parsePacket()) > 0) {
+    char message[32];
+    int length = discoveryUdp.read(message, min(packetSize, (int)sizeof(message) - 1));
+    message[length] = '\0';
+    if (!client.connected() || discoveryUdp.remoteIP() != dcsLinkIp) continue;
+
+    int enabled;
+    if (sscanf(message, "PANEL_LED_TEST|%d", &enabled) != 1 || (enabled != 0 && enabled != 1)) continue;
+    ledTestActive = enabled == 1;
+    lastLedTestCommand = millis();
+    ledcWrite(LED_PIN, ledTestActive ? 255 : currentLedPwm);
+  }
+
+  // Safety timeout if the release message is lost.
+  if (ledTestActive && millis() - lastLedTestCommand > 800) {
+    ledTestActive = false;
+    ledcWrite(LED_PIN, currentLedPwm);
+  }
+}
+
+// =====================================================
+// Ethernet and DCS-LINK discovery
+// =====================================================
+
+void macToText(char* output, size_t outputSize) {
+  snprintf(output, outputSize, "%02X:%02X:%02X:%02X:%02X:%02X",
+    mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+}
+
+void resetW5500() {
+  pinMode(W5500_RST, OUTPUT);
+  digitalWrite(W5500_RST, LOW);
+  delay(300);
+  digitalWrite(W5500_RST, HIGH);
+  delay(1000);
+}
+
+void startEthernet() {
+  SPI.begin(W5500_SCK, W5500_MISO, W5500_MOSI, W5500_CS);
+  SPI.setFrequency(8000000);
+  Ethernet.init(W5500_CS);
+
+  Serial.println("Requesting DHCP address...");
+  if (Ethernet.begin(mac) == 0) {
+    ethernetOk = false;
+    Serial.println("DHCP failed.");
+    return;
+  }
+
+  ethernetOk = true;
+  dcsLinkIp = IPAddress(0, 0, 0, 0);
+  discoveryUdp.stop();
+  discoveryUdp.begin(LOCAL_UDP_PORT);
+  Serial.print("DHCP address: ");
+  Serial.println(Ethernet.localIP());
+}
+
+void discoverDcsLink() {
+  char macText[18];
+  char request[100];
+  macToText(macText, sizeof(macText));
+  snprintf(request, sizeof(request), "DCS_PANEL_DISCOVER|%s|%s\n", macText, PANEL_NAME);
+
+  discoveryUdp.beginPacket(IPAddress(255, 255, 255, 255), DCS_LINK_DISCOVERY_PORT);
+  discoveryUdp.write((const uint8_t*)request, strlen(request));
+  discoveryUdp.endPacket();
+
+  unsigned long started = millis();
+  while (millis() - started < 250) {
+    int packetLength = discoveryUdp.parsePacket();
+    if (packetLength <= 0) {
+      delay(2);
+      continue;
+    }
+
+    char response[48];
+    int bytesToRead = min(packetLength, (int)sizeof(response) - 1);
+    int bytesRead = discoveryUdp.read(response, bytesToRead);
+    response[bytesRead] = '\0';
+
+    int port = 0;
+    if (sscanf(response, "DCS_PANEL_HUB|%d", &port) == 1 && port > 0 && port < 65536) {
+      dcsLinkIp = discoveryUdp.remoteIP();
+      dcsLinkPort = (uint16_t)port;
+      Serial.print("DCS-LINK found: ");
+      Serial.print(dcsLinkIp);
+      Serial.print(':');
+      Serial.println(dcsLinkPort);
+      return;
+    }
+  }
+}
+
+void connectToDcsLink() {
+  if (client.connected() || dcsLinkIp == IPAddress(0, 0, 0, 0)) return;
+
+  client.stop();
+  client.setTimeout(100);
+  if (!client.connect(dcsLinkIp, dcsLinkPort)) {
+    Serial.println("DCS-LINK connection failed.");
+    return;
+  }
+
+  char macText[18];
+  char hello[100];
+  macToText(macText, sizeof(macText));
+  snprintf(hello, sizeof(hello), "DCS_PANEL_HELLO|%s|%s|%s\n", macText, AIRCRAFT_NAME, MODULE_NAME);
+  client.print(hello);
+
+  telemetryPending = true;
+  for (size_t index = 0; index < POTENTIOMETER_COUNT; index++) {
+    potentiometers[index].lastSentValue = -1;
+  }
+  readPotentiometers(true);
+  sendCurrentSwitchesToDcs();
+  Serial.println("Connected to DCS-LINK.");
+}
+
+// =====================================================
+// Setup and main loop
+// =====================================================
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  Serial.println("F16 Audio 1 module starting.");
+
+  for (size_t index = 0; index < 3; index++) {
+    pinMode(comm1ModePins[index], INPUT_PULLUP);
+    pinMode(comm2ModePins[index], INPUT_PULLUP);
+  }
+
+  analogReadResolution(12);
+  analogSetAttenuation(ADC_11db);
+  for (size_t index = 0; index < POTENTIOMETER_COUNT; index++) {
+    potentiometers[index].filteredValue = analogRead(potentiometers[index].pin);
+    potentiometers[index].dcsValue = scalePotentiometer(potentiometers[index].filteredValue);
+  }
+
+  ledcAttach(LED_PIN, PWM_FREQUENCY, PWM_RESOLUTION);
+  ledcWrite(LED_PIN, 0);
+
+  resetW5500();
+  startEthernet();
+}
+
+void loop() {
+  unsigned long now = millis();
+
+  if (!ethernetOk) {
+    if (now - lastDhcpRetry >= 10000) {
+      lastDhcpRetry = now;
+      startEthernet();
+    }
+    delay(10);
+    return;
+  }
+
+  if (Ethernet.linkStatus() == LinkOFF) {
+    client.stop();
+    ledTestActive = false;
+    ledcWrite(LED_PIN, currentLedPwm);
+    delay(100);
+    return;
+  }
+
+  if (now - lastDhcpMaintain >= 60000) {
+    Ethernet.maintain();
+    lastDhcpMaintain = now;
+  }
+
+  handleLedTestCommands();
+
+  if (!client.connected()) {
+    if (now - lastDiscovery >= 1000) {
+      lastDiscovery = now;
+      discoverDcsLink();
+      connectToDcsLink();
+    }
+  } else {
+    int readLimit = 256;
+    while (client.available() && readLimit--) {
+      int input = client.read();
+      if (input < 0) break;
+      parser.processChar((char)input);
+      delayMicroseconds(20);
+    }
+  }
+
+  readPotentiometers(false);
+  DcsBios::PollingInput::pollInputs();
+  DcsBios::ExportStreamListener::loopAll();
+
+  if (client.connected() && (telemetryPending || millis() - lastTelemetryTime >= 100)) {
+    sendPanelTelemetry();
+    lastTelemetryTime = millis();
+    telemetryPending = false;
+  }
+
+  delay(5);
+}
